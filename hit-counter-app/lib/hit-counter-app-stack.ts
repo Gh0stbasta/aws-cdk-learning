@@ -2,91 +2,50 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigw from 'aws-cdk-lib/aws-apigateway';
-import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import { HitCounter } from './hitcounter'; // Importiert unser eigenes Custom Construct für den Hit-Counter
 
 /**
- * HitCounterAppStack ist unsere Haupt-CDK-Stack-Klasse.
- * Ein Stack ist wie ein Container für alle AWS-Ressourcen, die zusammengehören.
- * Alles was wir hier definieren, wird später als CloudFormation Stack deployed.
+ * HitCounterAppStack
+ * 
+ * Dieser Stack erstellt eine vollständige Serverless-Anwendung mit folgenden Komponenten:
+ * - Eine Lambda-Funktion als Backend (Geschäftslogik)
+ * - Ein HitCounter-Wrapper, der Zugriffe zählt
+ * - Ein API Gateway als öffentlicher HTTP-Endpunkt
  */
 export class HitCounterAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 1. DYNAMODB TABELLE - Unsere Datenbank für die Hit-Zähler
-    // ═══════════════════════════════════════════════════════════════════
-    
-    const table = new dynamodb.Table(this, 'Hits', {
-      // Der Partition Key ist der eindeutige Identifikator für jeden Eintrag.
-      // Hier verwenden wir 'path' (z.B. "/home", "/about"), um Zugriffe
-      // auf verschiedene Endpunkte zu zählen. Jeder Pfad bekommt einen eigenen Counter.
-      partitionKey: { 
-        name: 'path',                           // Name der Spalte
-        type: dynamodb.AttributeType.STRING     // Datentyp: Text
-      },
-      
-      // RemovalPolicy bestimmt, was beim Löschen des Stacks passiert.
-      // DESTROY = Tabelle wird komplett gelöscht (gut für Dev/Test)
-      // RETAIN = Tabelle bleibt bestehen (gut für Produktion mit wichtigen Daten)
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-    });
-
-    // ═══════════════════════════════════════════════════════════════════
-    // 2. LAMBDA FUNKTION - Das Herzstück unserer Logik
-    // ═══════════════════════════════════════════════════════════════════
-    
-    const hitCounterFn = new lambda.Function(this, 'HitCounterHandler', {
-      // Runtime: Welche Programmiersprache/Version verwendet wird
+    // 1. Erstelle die Haupt-Lambda-Funktion (unsere eigentliche Geschäftslogik)
+    // Diese Funktion gibt einfach eine "Hello Architect!" Nachricht zurück
+    const helloFn = new lambda.Function(this, 'HelloHandler', {
+      // Runtime-Umgebung: Node.js 18.x
       runtime: lambda.Runtime.NODEJS_18_X,
       
-      // Code-Quelle: Der 'lambda' Ordner wird gepackt und hochgeladen
-      // CDK sucht automatisch nach JavaScript/TypeScript Dateien darin
-      code: lambda.Code.fromAsset('lambda'),
+      // Code wird inline definiert (für Produktionsumgebungen würde man normalerweise externe Dateien verwenden)
+      // Die Funktion gibt einen HTTP 200 Status mit einer Begrüßungsnachricht zurück
+      code: lambda.Code.fromInline('exports.handler = async () => { return { statusCode: 200, body: "Hello Architect!" }; };'),
       
-      // Handler: Welche Datei und Funktion aufgerufen wird
-      // Format: "dateiname.funktionsname"
-      // Hier: lambda/hitcounter.js -> export.handler = ...
-      handler: 'hitcounter.handler',
-      
-      // Environment Variables: Wie Konfigurationswerte für unseren Code
-      // Diese können wir in der Lambda-Funktion mit process.env.VARIABLENNAME auslesen
-      environment: {
-        // Wir übergeben den Namen der DynamoDB Tabelle.
-        // Der Name wird von AWS automatisch generiert (z.B. "HitCounterAppStack-HitsXYZ123")
-        // Dadurch muss unser Lambda-Code nicht hart-codiert wissen, wie die Tabelle heißt
-        HITS_TABLE_NAME: table.tableName
-      }
+      // Handler-Methode: 'index.handler' bedeutet, dass die Funktion 'handler' in der Datei 'index' aufgerufen wird
+      handler: 'index.handler'
     });
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 3. IAM BERECHTIGUNGEN - Wer darf was?
-    // ═══════════════════════════════════════════════════════════════════
-    
-    // In AWS hat standardmäßig nichts Zugriff auf irgendetwas (Least Privilege Prinzip).
-    // Diese Zeile erstellt automatisch eine IAM Policy, die unserer Lambda-Funktion
-    // erlaubt, Daten in der DynamoDB Tabelle zu lesen UND zu schreiben.
-    // Ohne diese Zeile würde Lambda einen "Access Denied" Fehler bekommen.
-    table.grantReadWriteData(hitCounterFn);
+    // 2. Umhülle die Lambda-Funktion mit unserem Custom HitCounter Construct
+    // Der HitCounter sitzt "vor" der eigentlichen Lambda-Funktion und:
+    // - Zählt jeden Aufruf in einer DynamoDB-Tabelle
+    // - Leitet dann die Anfrage an die downstream-Funktion (helloFn) weiter
+    const helloWithCounter = new HitCounter(this, 'HelloHitCounter', {
+      // Die downstream-Funktion ist unsere helloFn - sie wird nach dem Zählen aufgerufen
+      downstream: helloFn
+    });
 
-    // ═══════════════════════════════════════════════════════════════════
-    // 4. API GATEWAY - Der öffentliche Eingang (HTTP Endpoint)
-    // ═══════════════════════════════════════════════════════════════════
-    
-    // LambdaRestApi erstellt automatisch:
-    // - Einen REST API Endpunkt (https://xyz123.execute-api.region.amazonaws.com/prod/)
-    // - Eine Standard-Route, die ALLE HTTP-Requests (GET, POST, etc.) an unsere Lambda weiterleitet
-    // - Die nötigen Berechtigungen, damit API Gateway unsere Lambda aufrufen darf
-    // 
-    // Nach dem Deployment bekommen wir eine URL, die wir im Browser öffnen können.
+    // 3. Erstelle ein API Gateway REST API
+    // Dies ist der öffentliche HTTP-Endpunkt, den Benutzer aufrufen können
+    // Der Handler zeigt auf den HitCounter (nicht direkt auf helloFn!)
+    // Request-Flow: API Gateway -> HitCounter Lambda -> DynamoDB (Zähler erhöhen) -> helloFn -> Response
     new apigw.LambdaRestApi(this, 'Endpoint', {
-      handler: hitCounterFn  // Verbindet das API Gateway mit unserer Lambda-Funktion
+      // Der Handler ist die Lambda-Funktion des HitCounters, die dann die downstream-Funktion aufruft
+      handler: helloWithCounter.handler
     });
-    
-    // Das war's! CDK kümmert sich nun um:
-    // - CloudFormation Template Generierung
-    // - Hochladen des Lambda-Codes nach S3
-    // - Erstellen aller Ressourcen in der richtigen Reihenfolge
-    // - Verknüpfen aller Berechtigungen und Abhängigkeiten
   }
 }
